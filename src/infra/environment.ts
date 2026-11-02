@@ -61,7 +61,9 @@ export function agentVariables(stateDir: string): Record<string, string | undefi
 async function written(file: string): Promise<boolean> {
   if (!(await lstat(file)).isFile()) return false
   const head = (await readFile(file, 'utf8')).split('\n', 2)
-  return [MARKER, ...LEGACY_MARKERS].some(marker => head.includes(marker))
+  // Windows adaptation: a .cmd twin carries the marker as `rem <marker>` and may use CRLF line endings, so each line
+  // is matched whole after stripping the carriage return and the optional `rem ` comment prefix.
+  return [MARKER, ...LEGACY_MARKERS].some(marker => head.some(line => { const text = line.replace(/\r$/, ''); return text === marker || text === `rem ${marker}` }))
 }
 async function own(file: string, text: string, mode = 0o644): Promise<void> {
   let foreign = false
@@ -90,6 +92,18 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     await rename(temporary, join(dir, name))
     kept.add(name)
   }
+  // Windows adaptation: workers run commands through pwsh, which resolves names against PATH where an extensionless
+  // sh script is not executable. Write a .cmd twin of every shim next to it; its second line carries the same marker
+  // so `written()` still owns the file. Elsewhere this writes nothing and the directory is unchanged.
+  const cmdShim = async (name: string, lines: readonly string[]): Promise<void> => {
+    if (process.platform !== 'win32') return
+    const temporary = join(dir, `.${name}.${process.pid}.tmp`)
+    await writeFile(temporary, ['@echo off', `rem ${MARKER}`, ...lines, ''].join('\r\n'))
+    await rename(temporary, join(dir, `${name}.cmd`))
+    kept.add(`${name}.cmd`)
+  }
+  const cmdRun = (program: string): string[] => [`@"${program.replaceAll('/', '\\')}" %*`]
+  const cmdFail = (message: string): string[] => [`echo ${message} >&2`, 'exit /b 1']
   const withoutShims = [
     `self=${shellQuote(dir)}`, 'rest=', 'IFS=:', 'set -f',
     'for entry in $PATH; do [ "$entry" = "$self" ] || rest="${rest:+$rest:}$entry"; done',
@@ -98,9 +112,14 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', run(github.cli))
-  await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  await cmdShim('gh', cmdRun(github.cli))
+  const larkMessage = 'lark-cli is unavailable: this installation has no Feishu bot.'
+  await shim('lark-cli', feishu ? run(feishu.cli) : fail(larkMessage))
+  await cmdShim('lark-cli', feishu ? cmdRun(feishu.cli) : cmdFail(larkMessage))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
-    await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
+    const message = `${name} is blocked in this installation; use gh, which acts as ${github.login}.`
+    await shim(name, fail(message))
+    await cmdShim(name, cmdFail(message))
   }
   for (const name of before) if (!kept.has(name)) await unlink(join(dir, name))
   await own(workerGitConfig(stateDir), [

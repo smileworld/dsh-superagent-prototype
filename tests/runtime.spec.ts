@@ -120,6 +120,8 @@ function feishu(id: string, text: string, overrides: Record<string, unknown> = {
   return feishuTrigger({ message_id: `om_${id}`, chat_id: CHAT, chat_type: 'group', sender_id: MEMBER, sender_type: 'user', content: text, create_time: String(Date.parse('2026-09-09T00:00:00Z') + Number(id.replace(/\D/g, '') || 0) * 1000), mentions: [{ id: 'ou_bot' }], ...overrides }, 'ou_bot', 'cli_bot')!
 }
 const worktreeName = 'fix-regression'
+/** Windows adaptation: the shell tool the host registers, and the Session restricts to, differs by platform. */
+const SHELL = process.platform === 'win32' ? 'pwsh' : 'bash'
 /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
 async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
   const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
@@ -164,7 +166,7 @@ beforeEach(async () => {
       if (agents.has(sessionId)) return
       const agentCtx = new Context()
       const preset = {}
-      const inherited = ['bash', 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
+      const inherited = [SHELL, 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
         'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit']
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
@@ -851,9 +853,13 @@ it('reports each setup problem where the operator fixes it, and checks the agent
   answers[`${AGENT()} api repos/acme/widgets --jq {name: .full_name, push: .permissions.push}`] = '{"name":"acme/widgets","push":true}\n'
   // The agent CLI runs in the workers' environment: without the shims on PATH.
   const check = subprocess.spawn.mock.calls.map(([spec]) => spec.argv).find(argv => argv.includes(AGENT()))!
-  expect(check[0]).toBe('env')
-  expect(check[1]!.startsWith('PATH=')).toBe(true)
-  expect(check[1]!.slice('PATH='.length).split(':')).not.toContain(join(directory, 'worker-bin'))
+  // Windows adaptation: there is no `env` command; the probe names the absolute CLI, whose path bypasses PATH lookup.
+  if (process.platform === 'win32') expect(check[0]).toBe(AGENT())
+  else {
+    expect(check[0]).toBe('env')
+    expect(check[1]!.startsWith('PATH=')).toBe(true)
+    expect(check[1]!.slice('PATH='.length).split(':')).not.toContain(join(directory, 'worker-bin'))
+  }
   const valid = { ...answers }
   // git older than 2.32 ignores GIT_CONFIG_GLOBAL and reads the operator's configuration.
   answers = { ...valid, [HELPERS]: 'file:/home/me/.gitconfig\0!gh auth git-credential\0' }
@@ -1004,9 +1010,11 @@ it('rewrites the blocked-command shims when the Executor settings change them, w
   const bin = join(directory, 'worker-bin')
   const save = (blockedCommands: string[]) => runtime.settings.save('executor', { ...runtime.store.settings().executor, blockedCommands }, runtime.store.blockRevision('executor'), 'panel')
   expect(await save(['personal-gh'])).toMatchObject({ saved: true, restarting: false })
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli', 'personal-gh'])
+  // Windows adaptation: each shim also has a `.cmd` twin there; the shim set is the same on both platforms.
+  const names = () => readdirSync(bin).filter(name => !name.endsWith('.cmd')).sort()
+  expect(names()).toEqual(['gh', 'lark-cli', 'personal-gh'])
   await save([])
-  expect(readdirSync(bin).sort()).toEqual(['gh', 'lark-cli'])
+  expect(names()).toEqual(['gh', 'lark-cli'])
   // The commands workers need cannot be blocked.
   await expect(save(['gh'])).rejects.toThrow()
   expect(restarts).not.toHaveBeenCalled()
@@ -1560,10 +1568,10 @@ it('refuses an ended ticket\'s worker its tools, and restricts the main Session 
   expect(guards.get(sessionId)!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
-  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', 'bash', 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }])
+  expect(restricts.get(runtime.masterId)).toEqual([{ allow: ['skill', SHELL, 'read', 'read_image', 'job_output', 'job_list', 'job_kill'] }])
   // A worker keeps only the profile's work tools: none that ask a person, change the profile, schedule or start work outside
   // the worker slots, reach other Sessions or edit documents, whenever they were registered.
-  expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get(sessionId)).toEqual([{ allow: ['read', 'read_image', 'grep', SHELL, 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
 })
 
 it('gives an explicit ticket\'s worker a prompt without the limits of an inferred Mandate', async () => {
@@ -1717,7 +1725,7 @@ it('gives a subagent of a worker only the worker\'s work tools, and none once th
   const child = agents.get('child-1')! as unknown as { session: { header: { parentSession?: string } } }
   child.session.header = { parentSession: sessionId }
   await (runtime as unknown as { ctx: Context }).ctx.parallel('agent/created', { agent: child } as never)
-  expect(restricts.get('child-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get('child-1')).toEqual([{ allow: ['read', 'read_image', 'grep', SHELL, 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
   expect(guards.get('child-1')!()).toBeUndefined()
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get('child-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
@@ -1739,7 +1747,7 @@ it('gives a subagent of a worker\'s subagent the same work tools and guard', asy
     agent.session.header = { parentSession: parent }
     await created.parallel('agent/created', { agent } as never)
   }
-  expect(restricts.get('grandchild-1')).toEqual([{ allow: ['read', 'read_image', 'grep', 'bash', 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
+  expect(restricts.get('grandchild-1')).toEqual([{ allow: ['read', 'read_image', 'grep', SHELL, 'job_output', 'job_list', 'job_kill', 'web_search', 'skill'] }])
   runtime.engine.stopTicket(ticket.id)
   expect(guards.get('grandchild-1')!()).toBe('Ticket ended; new work needs a new authorized ticket')
 })
